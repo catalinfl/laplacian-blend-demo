@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Laplacian Pyramid Blending</title>
+  </head>
+  <body>
+    <!-- Main (background) image -->
+    <img id="image" src="./src/assets/lol.jpg" alt="Main image" style="display:none" />
+
+    <div id="app" style="max-width:1200px; margin:0 auto; padding:20px; font-family:sans-serif; color:#eee;">
+      <h1>Laplacian Pyramid Blending</h1>
+      <p style="color:#aaa; line-height:1.6;">
+        Încarcă o imagine (patch) care va fi suprapusă peste imaginea principală.
+        Blending-ul prin piramida Laplaciană face ca marginile patch-ului să se
+        îmbine smooth cu fundalul — fără tăieturi vizibile.
+      </p>
+
+      <div style="margin: 20px 0;">
+        <label for="patchInput" style="cursor:pointer; background:#2563eb; color:#fff; padding:10px 20px; border-radius:6px; font-size:16px;">
+          📁 Încarcă imaginea patch
+        </label>
+        <input type="file" id="patchInput" accept="image/*" style="display:none" />
+        <span id="patchName" style="margin-left:12px; color:#888;"></span>
+      </div>
+
+      <div id="output" style="margin-top:20px;"></div>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
