@@ -5,28 +5,46 @@
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Laplacian Pyramid Blending</title>
+    <link rel="stylesheet" href="/src/style.css" />
   </head>
   <body>
-    <!-- Main (background) image -->
-    <img id="image" src="./src/assets/lol.jpg" alt="Main image" style="display:none" />
+    <!-- Hidden source images -->
+    <img id="imgApple"  src="./src/assets/apple.png"  style="display:none" />
+    <img id="imgOrange" src="./src/assets/orange.png" style="display:none" />
 
-    <div id="app" style="max-width:1200px; margin:0 auto; padding:20px; font-family:sans-serif; color:#eee;">
-      <h1>Laplacian Pyramid Blending</h1>
-      <p style="color:#aaa; line-height:1.6;">
-        Încarcă o imagine (patch) care va fi suprapusă peste imaginea principală.
-        Blending-ul prin piramida Laplaciană face ca marginile patch-ului să se
-        îmbine smooth cu fundalul — fără tăieturi vizibile.
+    <div id="app">
+      <p class="subtitle">
+        Comparation: direct cut vs. blending smooth with laplacian pyramids
       </p>
 
-      <div style="margin: 20px 0;">
-        <label for="patchInput" style="cursor:pointer; background:#2563eb; color:#fff; padding:10px 20px; border-radius:6px; font-size:16px;">
-          📁 Încarcă imaginea patch
+      <div id="controls">
+        <label>
+          Pyramid levels:
+          <input type="range" id="levels" min="1" max="20" value="6" />
+          <span id="levelsVal">6</span>
         </label>
-        <input type="file" id="patchInput" accept="image/*" style="display:none" />
-        <span id="patchName" style="margin-left:12px; color:#888;"></span>
       </div>
 
-      <div id="output" style="margin-top:20px;"></div>
+      <div id="grid">
+        <div class="cell">
+          <h2>Apple</h2>
+          <canvas id="canvasApple"></canvas>
+        </div>
+        <div class="cell">
+          <h2>Orange</h2>
+          <canvas id="canvasOrange"></canvas>
+        </div>
+        <div class="cell">
+          <h2>Direct Connection</h2>
+          <canvas id="canvasDirect"></canvas>
+        </div>
+        <div class="cell">
+          <h2>Pyramid Blending</h2>
+          <canvas id="canvasPyramid"></canvas>
+        </div>
+      </div>
+
+      <div id="status">Load opencv…</div>
     </div>
 
     <script type="module" src="/src/main.ts"></script>

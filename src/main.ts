@@ -1,412 +1,287 @@
-import './style.css';
 import cv from "@techstark/opencv-js";
+import "./style.css";
 
-/**
- * =====================================================
- *  LAPLACIAN PYRAMID BLENDING — Explicație pas cu pas
- * =====================================================
- *
- * Scopul: lipim o imagine mică (patch) peste una mare (fundal)
- * așa încât marginile să se îmbine smooth, fără cusătură vizibilă.
- *
- * Pași:
- *  1. Citim imaginea principală (fundal) și patch-ul uploadat.
- *  2. Plasăm patch-ul în centrul fundalului.
- *  3. Creăm o MASCĂ: alb unde e patch-ul, negru în rest.
- *  4. Construim piramida Gaussiană (blur progresiv) pentru:
- *     - fundal, patch (extins la dimensiunea fundalului), și mască.
- *  5. Din piramida Gaussiană extragem piramida Laplaciană
- *     (= detaliile/edge-urile la fiecare nivel de rezoluție).
- *  6. La FIECARE nivel, combinăm detaliile patch-ului cu cele
- *     ale fundalului, ghidați de masca blur-uită la acel nivel.
- *     → La nivelele mici (rezoluție mică), masca e foarte blur-uită,
- *       deci tranziția e graduală = FĂRĂ cusătură vizibilă.
- *  7. Reconstruim imaginea finală din piramida Laplaciană combinată.
- *
- * Rezultat: patch-ul apare natural pe fundal, cu margini smooth.
- * =====================================================
- */
+function waitForOpenCV(): Promise<void> {
+  return new Promise((resolve) => {
+    if ((cv as any).Mat) {
+      resolve();
+      return;
+    }
+    (cv as any).onRuntimeInitialized = () => resolve();
+  });
+}
 
-const LEVELS = 6;
+function waitForImage(img: HTMLImageElement): Promise<void> {
+  return new Promise((resolve) => {
+    if (img.complete && img.naturalWidth > 0) {
+      resolve();
+      return;
+    }
+    img.onload = () => resolve();
+  });
 
-let cv2: any;
-
-// ─── Piramida Gaussiană ───────────────────────────────
-// Fiecare nivel e blur + resize la jumătate.
-// Nivel 0 = imaginea originală, nivel N = cea mai blur-uită.
-function buildGaussianPyramid(src: any, levels: number): any[] {
-  const pyramid: any[] = [src.clone()];
-  let current = pyramid[0];
-
+}
+function buildGaussianPyramid(src: InstanceType<typeof cv.Mat>, levels: number) {
+  const pyramid: InstanceType<typeof cv.Mat>[] = [src.clone()];
   for (let i = 1; i < levels; i++) {
-    const down = new cv2.Mat();
-    cv2.pyrDown(current, down);
+    const prev = pyramid[i - 1];
+    const down = new cv.Mat();
+    // explicitly compute the target size (ceil to avoid losing pixels)
+    const dstSize = new cv.Size(
+      Math.ceil(prev.cols / 2),
+      Math.ceil(prev.rows / 2)
+    );
+    cv.pyrDown(prev, down, dstSize);
     pyramid.push(down);
-    current = down;
   }
   return pyramid;
 }
 
-// ─── Piramida Laplaciană ──────────────────────────────
-// Laplacian[i] = Gauss[i] - pyrUp(Gauss[i+1])
-// = detaliile pierdute între nivel i și i+1
-// Ultimul nivel = Gauss[N] (cel mai blur).
-function buildLaplacianPyramid(gauss: any[]): any[] {
-  const lap: any[] = [];
+function buildLaplacianPyramid(gaussPyr: InstanceType<typeof cv.Mat>[]) {
+  const lapPyr: InstanceType<typeof cv.Mat>[] = [];
 
-  for (let i = 0; i < gauss.length - 1; i++) {
-    const up = new cv2.Mat();
-    cv2.pyrUp(gauss[i + 1], up, new cv2.Size(gauss[i].cols, gauss[i].rows));
-    const diff = new cv2.Mat();
-    cv2.subtract(gauss[i], up, diff);
-    lap.push(diff);
+  for (let i = 0; i < gaussPyr.length - 1; i++) {
+    // up-sample the next (smaller) level back to current size
+    const up = new cv.Mat();
+    cv.pyrUp(gaussPyr[i + 1], up, gaussPyr[i].size());
+
+    // convert both to 64F before subtracting to preserve negatives
+    const curF = new cv.Mat();
+    const upF = new cv.Mat();
+    gaussPyr[i].convertTo(curF, cv.CV_64FC3);
+    up.convertTo(upF, cv.CV_64FC3);
+
+    // laplacian up-sampled next level
+    const lap = new cv.Mat();
+    cv.subtract(curF, upF, lap);
+    lapPyr.push(lap);
     up.delete();
+    curF.delete();
+    upF.delete();
   }
-  // Ultimul nivel = imaginea cea mai blur-uită (baza piramidei)
-  lap.push(gauss[gauss.length - 1].clone());
-  return lap;
+  // last level is low res, converted to 64F for consistency
+  const lastF = new cv.Mat();
+  gaussPyr[gaussPyr.length - 1].convertTo(lastF, cv.CV_64FC3);
+  lapPyr.push(lastF);
+  return lapPyr;
 }
 
-// ─── Blend la un singur nivel ─────────────────────────
-// result = patch * mask + fundal * (1 - mask)
-// La nivele blur-uite, mask e smooth → margini smooth
-function blendWithMask(patch: any, background: any, mask: any): any {
-  const mask3 = new cv2.Mat();
-  const channels = new cv2.MatVector();
-  channels.push_back(mask);
-  channels.push_back(mask);
-  channels.push_back(mask);
-  cv2.merge(channels, mask3);
-  channels.delete();
+function blendLaplacianPyramids(lapA: InstanceType<typeof cv.Mat>[], lapB: InstanceType<typeof cv.Mat>[], maskPyr: InstanceType<typeof cv.Mat>[]) {
+  const blended: InstanceType<typeof cv.Mat>[] = [];
 
-  const invMask3 = new cv2.Mat();
-  const ones = new cv2.Mat(mask3.rows, mask3.cols, mask3.type(), new cv2.Scalar(1, 1, 1, 1));
-  cv2.subtract(ones, mask3, invMask3);
-  ones.delete();
+  for (let i = 0; i < lapA.length; i++) {
+    const m = new cv.Mat();
+    maskPyr[i].convertTo(m, cv.CV_64FC3, 1.0 / 255.0);
 
-  const part1 = new cv2.Mat();
-  const part2 = new cv2.Mat();
-  cv2.multiply(patch, mask3, part1);
-  cv2.multiply(background, invMask3, part2);
-  mask3.delete();
-  invMask3.delete();
+    const aMasked = new cv.Mat();
+    const oneMinusM = new cv.Mat();
+    const bMasked = new cv.Mat();
+    const result = new cv.Mat();
 
-  const result = new cv2.Mat();
-  cv2.add(part1, part2, result);
-  part1.delete();
-  part2.delete();
-  return result;
+    cv.multiply(lapA[i], m, aMasked);
+
+    const ones = new cv.Mat(m.rows, m.cols, m.type(), new cv.Scalar(1, 1, 1, 1));
+    cv.subtract(ones, m, oneMinusM);
+    cv.multiply(lapB[i], oneMinusM, bMasked);
+
+    cv.add(aMasked, bMasked, result);
+
+    blended.push(result);
+
+    m.delete();
+    aMasked.delete(); oneMinusM.delete(); bMasked.delete(); ones.delete();
+  }
+  return blended;
 }
 
-// ─── Reconstrucție din piramida Laplaciană ─────────────
-// Parcurgem de la cel mai blur nivel la cel mai detaliat:
-// current = pyrUp(current) + Laplacian[i]
-function reconstructFromLaplacian(pyramid: any[]): any {
-  let current = pyramid[pyramid.length - 1].clone();
+function reconstructFromLaplacian(lapPyr: InstanceType<typeof cv.Mat>[]) {
+  let current = lapPyr[lapPyr.length - 1].clone();
 
-  for (let i = pyramid.length - 2; i >= 0; i--) {
-    const up = new cv2.Mat();
-    cv2.pyrUp(current, up, new cv2.Size(pyramid[i].cols, pyramid[i].rows));
+  for (let i = lapPyr.length - 2; i >= 0; i--) {
+    const up = new cv.Mat();
+    cv.pyrUp(current, up, lapPyr[i].size());
+    const next = new cv.Mat();
+    cv.add(up, lapPyr[i], next);
     current.delete();
-    const result = new cv2.Mat();
-    cv2.add(up, pyramid[i], result);
     up.delete();
-    current = result;
+    current = next;
   }
   return current;
 }
 
-// ─── Normalizare Laplacian pt vizualizare ─────────────
-// Valorile Laplacian pot fi negative; le aducem la [0,255]
-function normalizeLaplacianLevel(lap: any): any {
-  const channels = new cv2.MatVector();
-  cv2.split(lap, channels);
-  let gMin = Infinity, gMax = -Infinity;
-  for (let c = 0; c < channels.size(); c++) {
-    const mm = cv2.minMaxLoc(channels.get(c));
-    if (mm.minVal < gMin) gMin = mm.minVal;
-    if (mm.maxVal > gMax) gMax = mm.maxVal;
-  }
-  channels.delete();
-  const range = gMax - gMin || 1;
-  const offset = new cv2.Mat(lap.rows, lap.cols, lap.type(), new cv2.Scalar(-gMin, -gMin, -gMin));
-  const shifted = new cv2.Mat();
-  cv2.add(lap, offset, shifted);
-  offset.delete();
-  const normalized = new cv2.Mat();
-  shifted.convertTo(normalized, cv2.CV_8UC3, 255.0 / range);
-  shifted.delete();
-  return normalized;
+function freePyramid(pyr: InstanceType<typeof cv.Mat>[]) {
+  pyr.forEach((m) => m.delete());
 }
 
-// ─── UI helpers ───────────────────────────────────────
-function addToContainer(parent: HTMLElement, label: string, mat: any) {
-  const div = document.createElement('div');
-  div.style.cssText = 'margin-bottom:16px; display:inline-block; margin-right:16px; vertical-align:top;';
+function createMask(rows: number, cols: number) {
+  const mask = new cv.Mat(rows, cols, cv.CV_8UC3, new cv.Scalar(0, 0, 0, 128));
+  const halfCols = Math.floor(cols / 2);
 
-  const title = document.createElement('p');
-  title.textContent = label;
-  title.style.cssText = 'margin:0 0 4px; font-weight:bold; color:#eee; font-size:13px;';
-
-  const canvas = document.createElement('canvas');
-  const display = new cv2.Mat();
-  const ch = mat.channels();
-  if (ch === 1) {
-    cv2.cvtColor(mat, display, cv2.COLOR_GRAY2RGBA);
-  } else if (ch === 3) {
-    cv2.cvtColor(mat, display, cv2.COLOR_RGB2RGBA);
-  } else {
-    mat.copyTo(display);
-  }
-  cv2.imshow(canvas, display);
-  display.delete();
-  canvas.style.cssText = 'max-width:480px; height:auto; border:1px solid #333;';
-
-  div.appendChild(title);
-  div.appendChild(canvas);
-  parent.appendChild(div);
-}
-
-function addSection(container: HTMLElement, title: string, description: string): HTMLElement {
-  const section = document.createElement('div');
-  section.style.cssText = 'margin-bottom:32px;';
-  section.innerHTML = `
-    <h2 style="color:#eee; margin:0 0 4px;">${title}</h2>
-    <p style="color:#999; margin:0 0 12px; font-size:14px; line-height:1.5;">${description}</p>
-  `;
-  container.appendChild(section);
-  return section;
-}
-
-// ─── Main blending logic ──────────────────────────────
-function blend(bgImg: HTMLImageElement, patchImg: HTMLImageElement) {
-  const output = document.getElementById('output')!;
-  output.textContent = 'Processing...';
-
-  // Yield to browser so "Processing..." is visible
-  setTimeout(() => {
-    try {
-      doBlend(bgImg, patchImg, output);
-    } catch (error) {
-      output.textContent = `Error: ${String(error)}`;
-      console.error(error);
-    }
-  }, 50);
-}
-
-function doBlend(bgImg: HTMLImageElement, patchImg: HTMLImageElement, container: HTMLElement) {
-  // 1. Read images
-  // Browser/canvas pipeline: keep images in RGB.
-  const bgRGBA = cv2.imread(bgImg);
-  const bg = new cv2.Mat();
-  cv2.cvtColor(bgRGBA, bg, cv2.COLOR_RGBA2RGB);
-  bgRGBA.delete();
-
-  const patchRGBA = cv2.imread(patchImg);
-  const patchRaw = new cv2.Mat();
-  cv2.cvtColor(patchRGBA, patchRaw, cv2.COLOR_RGBA2RGB);
-  patchRGBA.delete();
-
-  // 2. Resize patch to fit inside bg (max 40% of bg size, keep aspect ratio)
-  const maxPatchW = Math.floor(bg.cols * 0.4);
-  const maxPatchH = Math.floor(bg.rows * 0.4);
-  const patchScale = Math.min(1, maxPatchW / patchRaw.cols, maxPatchH / patchRaw.rows);
-  const pw = Math.round(patchRaw.cols * patchScale);
-  const ph = Math.round(patchRaw.rows * patchScale);
-  const patchResized = new cv2.Mat();
-  cv2.resize(patchRaw, patchResized, new cv2.Size(pw, ph), 0, 0, cv2.INTER_AREA);
-  patchRaw.delete();
-
-  // 3. Place patch in center — create full-size "patch layer" and mask
-  const cx = Math.floor((bg.cols - pw) / 2);
-  const cy = Math.floor((bg.rows - ph) / 2);
-
-  // patchFull = copy of bg, with patch region overwritten
-  const patchFull = bg.clone();
-  const roi = patchFull.roi(new cv2.Rect(cx, cy, pw, ph));
-  patchResized.copyTo(roi);
+  // left half to white
+  const roi = mask.roi(new cv.Rect(0, 0, halfCols, rows));
+  roi.setTo(new cv.Scalar(255, 255, 255, 255));
   roi.delete();
-  patchResized.delete();
 
-  // HARD binary mask: 255 inside patch, 0 outside.
-  const mask = cv2.Mat.zeros(bg.rows, bg.cols, cv2.CV_8UC1);
-  const maskRoi = mask.roi(new cv2.Rect(cx, cy, pw, ph));
-  maskRoi.setTo(new cv2.Scalar(255));
-  maskRoi.delete();
-
-  // Naive paste for 1:1 comparison
-  const naivePaste = bg.clone();
-  const naiveRoi = naivePaste.roi(new cv2.Rect(cx, cy, pw, ph));
-  const patchRegion = patchFull.roi(new cv2.Rect(cx, cy, pw, ph));
-  patchRegion.copyTo(naiveRoi);
-  naiveRoi.delete();
-  patchRegion.delete();
-
-  // Convert to float [0,1]
-  const bgF = new cv2.Mat();
-  const patchFullF = new cv2.Mat();
-  const maskF = new cv2.Mat();
-  bg.convertTo(bgF, cv2.CV_32FC3, 1.0 / 255.0);
-  patchFull.convertTo(patchFullF, cv2.CV_32FC3, 1.0 / 255.0);
-  mask.convertTo(maskF, cv2.CV_32FC1, 1.0 / 255.0);
-
-  // Compute effective pyramid levels
-  const minDim = Math.min(bg.rows, bg.cols);
-  const effectiveLevels = Math.max(2, Math.min(LEVELS, Math.floor(Math.log2(minDim)) - 2));
-  console.log(`effectiveLevels=${effectiveLevels}, image=${bg.cols}x${bg.rows}`);
-
-  // Build Gaussian pyramids for images
-  const gaussBg = buildGaussianPyramid(bgF, effectiveLevels);
-  const gaussPatch = buildGaussianPyramid(patchFullF, effectiveLevels);
-
-  // Build mask pyramid with AGGRESSIVE independent blur at each level.
-  // pyrDown alone only spreads the boundary ~2px per level (too subtle).
-  // We blur each level with a kernel = 40% of the level width → very wide transition.
-  const gaussMask: any[] = [];
-  let currentMaskLevel = maskF.clone();
-  for (let i = 0; i < effectiveLevels; i++) {
-    // Apply strong Gaussian blur at this level
-    const blurred = new cv2.Mat();
-    const levelMinDim = Math.min(currentMaskLevel.rows, currentMaskLevel.cols);
-    let ksize = Math.round(levelMinDim * 0.4) | 1; // 40% of dimension, must be odd
-    if (ksize < 3) ksize = 3;
-    cv2.GaussianBlur(currentMaskLevel, blurred, new cv2.Size(ksize, ksize), 0);
-    // Apply blur multiple times for wider spread
-    cv2.GaussianBlur(blurred, blurred, new cv2.Size(ksize, ksize), 0);
-    cv2.GaussianBlur(blurred, blurred, new cv2.Size(ksize, ksize), 0);
-    gaussMask.push(blurred);
-
-    const stats = cv2.minMaxLoc(blurred);
-    console.log(`gaussMask[${i}] ${blurred.cols}x${blurred.rows} ksize=${ksize} min=${stats.minVal.toFixed(4)} max=${stats.maxVal.toFixed(4)}`);
-
-    // Downsample for next level
-    if (i < effectiveLevels - 1) {
-      const down = new cv2.Mat();
-      cv2.pyrDown(currentMaskLevel, down);
-      currentMaskLevel.delete();
-      currentMaskLevel = down;
-    }
-  }
-  currentMaskLevel.delete();
-
-  // Build Laplacian pyramids
-  const lapBg = buildLaplacianPyramid(gaussBg);
-  const lapPatch = buildLaplacianPyramid(gaussPatch);
-
-  // Blend each level: patch where mask≈1, bg where mask≈0, gradient in between
-  const blendedPyramid: any[] = [];
-  for (let i = 0; i < lapBg.length; i++) {
-    const blended = blendWithMask(lapPatch[i], lapBg[i], gaussMask[i]);
-    blendedPyramid.push(blended);
-  }
-
-  // Reconstruct final image from blended Laplacian pyramid
-  const reconstructedF = reconstructFromLaplacian(blendedPyramid);
-  const resultMat = new cv2.Mat();
-  reconstructedF.convertTo(resultMat, cv2.CV_8UC3, 255.0);
-
-  // FLOAT-level comparison with naive paste
-  const naiveF = new cv2.Mat();
-  naivePaste.convertTo(naiveF, cv2.CV_32FC3, 1.0 / 255.0);
-  const diffF = new cv2.Mat();
-  cv2.absdiff(naiveF, reconstructedF, diffF);
-  const diffChans = new cv2.MatVector();
-  cv2.split(diffF, diffChans);
-  const diffStats = cv2.minMaxLoc(diffChans.get(0));
-  console.log(`FLOAT |naive - pyramid| ch0: min=${diffStats.minVal.toFixed(6)}, max=${diffStats.maxVal.toFixed(6)}`);
-  diffChans.delete();
-  // Convert diff to visible: amplify 50× and scale to uint8
-  const diffVis = new cv2.Mat();
-  diffF.convertTo(diffVis, cv2.CV_8UC3, 255.0 * 50.0);
-  diffF.delete();
-  naiveF.delete();
-  reconstructedF.delete();
-
-  // ──── RENDER OUTPUT ────
-  container.innerHTML = '';
-
-  // Section 1: Source images
-  const s1 = addSection(container,
-    '1. Imagini sursă',
-    'Imaginea principală (fundalul) și patch-ul uploadat.'
-  );
-  addToContainer(s1, 'Fundal', bg);
-  const patchVis = patchFull.roi(new cv2.Rect(cx, cy, pw, ph));
-  addToContainer(s1, `Patch (${pw}×${ph}px)`, patchVis);
-  patchVis.delete();
-
-  // Section 2: Comparație
-  const s2 = addSection(container,
-    '2. Comparație: Naive vs Laplacian Pyramid Blend',
-    'Naive = inserare directă (hard edges). Laplacian = blend prin piramidă (smooth edges).<br>'
-    + 'Diferența (×50) evidențiază zona de tranziție smooth în jurul patch-ului.'
-  );
-  addToContainer(s2, 'Naive paste (hard edges)', naivePaste);
-  addToContainer(s2, 'Laplacian Blend (smooth)', resultMat);
-  addToContainer(s2, '|Diferență| ×50 (float)', diffVis);
-
-  // Section 3: Mask at each pyramid level
-  const s3 = addSection(container,
-    '3. Masca la fiecare nivel de piramidă',
-    'Masca blur-uită agresiv (kernel = 40% din rezoluția nivelului, 3 treceri). '
-    + 'La nivele mici, masca e foarte smooth → tranziție graduală.'
-  );
-  for (let i = 0; i < gaussMask.length; i++) {
-    const vis = new cv2.Mat();
-    gaussMask[i].convertTo(vis, cv2.CV_8UC1, 255.0);
-    addToContainer(s3, `Nivel ${i} (${gaussMask[i].cols}×${gaussMask[i].rows})`, vis);
-    vis.delete();
-  }
-
-  // Section 4: Blended Laplacian pyramid levels
-  const s4 = addSection(container,
-    '4. Piramida Laplaciană (blend-uită)',
-    'Detalii combinate la fiecare scară.'
-  );
-  for (let i = 0; i < blendedPyramid.length; i++) {
-    const vis = normalizeLaplacianLevel(blendedPyramid[i]);
-    addToContainer(s4, `Nivel ${i}`, vis);
-    vis.delete();
-  }
-
-  // Cleanup
-  bg.delete(); patchFull.delete(); mask.delete(); naivePaste.delete();
-  resultMat.delete(); diffVis.delete();
-  bgF.delete(); patchFullF.delete(); maskF.delete();
-  gaussBg.forEach((m: any) => m.delete());
-  gaussPatch.forEach((m: any) => m.delete());
-  gaussMask.forEach((m: any) => m.delete());
-  lapBg.forEach((m: any) => m.delete());
-  lapPatch.forEach((m: any) => m.delete());
-  blendedPyramid.forEach((m: any) => m.delete());
+  return mask;
 }
 
-// ─── Init ─────────────────────────────────────────────
-const mainImg = document.getElementById('image') as HTMLImageElement;
-const patchInput = document.getElementById('patchInput') as HTMLInputElement;
-const patchNameSpan = document.getElementById('patchName') as HTMLElement;
-const outputDiv = document.getElementById('output') as HTMLElement;
+function directConnection(imgA: InstanceType<typeof cv.Mat>, imgB: InstanceType<typeof cv.Mat>) {
+  const result = imgB.clone();
+  const halfCols = Math.floor(imgA.cols / 2);
 
-(cv as any).onRuntimeInitialized = () => {
-  cv2 = cv;
-  console.log('OpenCV ready');
-  outputDiv.textContent = 'OpenCV încărcat. Încarcă o imagine patch pentru a începe.';
+  const srcRoi = imgA.roi(new cv.Rect(0, 0, halfCols, imgA.rows));
+  const dstRoi = result.roi(new cv.Rect(0, 0, halfCols, result.rows));
+  srcRoi.copyTo(dstRoi);
+  srcRoi.delete();
+  dstRoi.delete();
 
-  patchInput.addEventListener('change', () => {
-    const file = patchInput.files?.[0];
-    if (!file) return;
+  return result;
+}
 
-    patchNameSpan.textContent = file.name;
+async function main() {
+  const statusEl = document.getElementById("status")!;
 
-    const patchImg = new Image();
-    patchImg.onload = () => {
-      if (mainImg.complete && mainImg.naturalWidth > 0) {
-        blend(mainImg, patchImg);
-      } else {
-        mainImg.onload = () => blend(mainImg, patchImg);
-      }
-    };
-    patchImg.src = URL.createObjectURL(file);
-  });
-};
+  statusEl.textContent = "w8 opencv";
+  await waitForOpenCV();
+  statusEl.textContent = "load images";
 
+  const imgAppleEl = document.getElementById("imgApple") as HTMLImageElement;
+  const imgOrangeEl = document.getElementById("imgOrange") as HTMLImageElement;
+  await Promise.all([waitForImage(imgAppleEl), waitForImage(imgOrangeEl)]);
+
+  statusEl.textContent = "Processing …";
+
+  const levelsInput = document.getElementById("levels") as HTMLInputElement;
+  const levelsVal = document.getElementById("levelsVal")!;
+
+  const minDim = Math.min(imgAppleEl.naturalHeight, imgAppleEl.naturalWidth);
+  const maxLevels = Math.max(1, Math.floor(Math.log2(minDim)));
+  levelsInput.max = String(maxLevels);
+  if (parseInt(levelsInput.value, 10) > maxLevels) {
+    levelsInput.value = String(maxLevels);
+  }
+
+  function run() {
+    const levels = parseInt(levelsInput.value, 10);
+    levelsVal.textContent = String(levels);
+
+    const matA = cv.imread(imgAppleEl);  
+    const matB = cv.imread(imgOrangeEl); 
+
+    if (matA.rows !== matB.rows || matA.cols !== matB.cols) {
+      cv.resize(matB, matB, matA.size());
+    }
+
+    const a3 = new cv.Mat();
+    const b3 = new cv.Mat();
+    cv.cvtColor(matA, a3, cv.COLOR_RGBA2RGB);
+    cv.cvtColor(matB, b3, cv.COLOR_RGBA2RGB);
+    matA.delete();
+    matB.delete();
+
+    // pad images symmetrically to keep seam centered across levels
+    const divisor = Math.pow(2, levels);
+    const extraRows = (divisor - (a3.rows % divisor)) % divisor;
+    const extraCols = (divisor - (a3.cols % divisor)) % divisor;
+    const padTop = Math.floor(extraRows / 2);
+    const padBottom = extraRows - padTop;
+    const padLeft = Math.floor(extraCols / 2);
+    const padRight = extraCols - padLeft;
+    if (extraRows > 0 || extraCols > 0) {
+      cv.copyMakeBorder(a3, a3, padTop, padBottom, padLeft, padRight, cv.BORDER_REFLECT);
+      cv.copyMakeBorder(b3, b3, padTop, padBottom, padLeft, padRight, cv.BORDER_REFLECT);
+    }
+    // Original display dimensions and top-left crop offset in padded image
+    const origRows = a3.rows - extraRows;
+    const origCols = a3.cols - extraCols;
+
+    // original images
+    const a3Display = a3.roi(new cv.Rect(padLeft, padTop, origCols, origRows));
+    const b3Display = b3.roi(new cv.Rect(padLeft, padTop, origCols, origRows));
+    showOnCanvas("canvasApple", a3Display);
+    showOnCanvas("canvasOrange", b3Display);
+    a3Display.delete();
+    b3Display.delete();
+
+    // direct connection (no blending)
+    const directResult = directConnection(a3, b3);
+    const directCropped = directResult.roi(new cv.Rect(padLeft, padTop, origCols, origRows));
+    showOnCanvas("canvasDirect", directCropped);
+    directCropped.delete();
+    directResult.delete();
+
+    // laplacian pyramid blending
+    const aF = new cv.Mat();
+    const bF = new cv.Mat();
+    a3.convertTo(aF, cv.CV_64FC3, 1.0 / 255.0);
+    b3.convertTo(bF, cv.CV_64FC3, 1.0 / 255.0);
+
+    const mask = createMask(a3.rows, a3.cols);
+
+    const gpA = buildGaussianPyramid(aF, levels);
+    const gpB = buildGaussianPyramid(bF, levels);
+    const gpM = buildGaussianPyramid(mask, levels);
+
+    const lpA = buildLaplacianPyramid(gpA);
+    const lpB = buildLaplacianPyramid(gpB);
+
+    const blendedPyr = blendLaplacianPyramids(lpA, lpB, gpM);
+
+    const reconstructed = reconstructFromLaplacian(blendedPyr);
+
+    // clip to [0, 255] and convert back to 8 bit for display
+    const result8 = new cv.Mat();
+    reconstructed.convertTo(result8, cv.CV_8UC3, 255.0);
+
+    const resultCropped = result8.roi(new cv.Rect(padLeft, padTop, origCols, origRows));
+    showOnCanvas("canvasPyramid", resultCropped);
+
+    // cleanup 
+    resultCropped.delete();
+    result8.delete();
+    reconstructed.delete();
+    freePyramid(blendedPyr);
+    freePyramid(lpA);
+    freePyramid(lpB);
+    freePyramid(gpA);
+    freePyramid(gpB);
+    freePyramid(gpM);
+    mask.delete();
+    aF.delete();
+    bF.delete();
+    a3.delete();
+    b3.delete();
+
+    statusEl.textContent = `level ${levels}`;
+  }
+
+  function showOnCanvas(canvasId: string, mat: InstanceType<typeof cv.Mat>) {
+    const canvas = document.getElementById(canvasId) as HTMLCanvasElement;
+    // Convert to RGBA for canvas display
+    const rgba = new cv.Mat();
+    if (mat.channels() === 3) {
+      cv.cvtColor(mat, rgba, cv.COLOR_RGB2RGBA);
+    } else {
+      mat.copyTo(rgba);
+    }
+    // Ensure 8-bit
+    if (rgba.type() !== cv.CV_8UC4) {
+      const tmp = new cv.Mat();
+      rgba.convertTo(tmp, cv.CV_8UC4);
+      rgba.delete();
+      cv.imshow(canvas, tmp);
+      tmp.delete();
+    } else {
+      cv.imshow(canvas, rgba);
+      rgba.delete();
+    }
+  }
+
+  // Initial run
+  run();
+
+  // re-run when levels change
+  levelsInput.addEventListener("input", () => run());
+}
+
+main().catch(console.error);
