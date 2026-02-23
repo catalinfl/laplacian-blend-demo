@@ -113,15 +113,21 @@ function freePyramid(pyr: InstanceType<typeof cv.Mat>[]) {
   pyr.forEach((m) => m.delete());
 }
 
-function createMask(rows: number, cols: number) {
-  const mask = new cv.Mat(rows, cols, cv.CV_8UC3, new cv.Scalar(0, 0, 0, 128));
-  const halfCols = Math.floor(cols / 2);
+function createMask(rows: number, cols: number, featherWidth = 50, steepness = 10) {
+  const mask = new cv.Mat(rows, cols, cv.CV_8UC3, new cv.Scalar(0, 0, 0));
+  const half = Math.floor(cols / 2);
 
-  // left half to white
-  const roi = mask.roi(new cv.Rect(0, 0, halfCols, rows));
-  roi.setTo(new cv.Scalar(255, 255, 255, 255));
-  roi.delete();
+  for (let x = 0; x < cols; x++) {
+    const t = (x - half) / featherWidth;
+    const val = Math.round(255 * (1 / (1 + Math.exp(steepness * t))));
 
+    for (let y = 0; y < rows; y++) {
+      mask.ucharPtr(y, x)[0] = val;
+      mask.ucharPtr(y, x)[1] = val;
+      mask.ucharPtr(y, x)[2] = val;
+    }
+  }
+  
   return mask;
 }
 
@@ -216,7 +222,7 @@ async function main() {
     a3.convertTo(aF, cv.CV_64FC3, 1.0 / 255.0);
     b3.convertTo(bF, cv.CV_64FC3, 1.0 / 255.0);
 
-    const mask = createMask(a3.rows, a3.cols);
+    const mask = createMask(a3.rows, a3.cols, 5, 500);
 
     const gpA = buildGaussianPyramid(aF, levels);
     const gpB = buildGaussianPyramid(bF, levels);
